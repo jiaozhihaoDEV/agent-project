@@ -1,11 +1,11 @@
-from func_timeout import func_timeout, FunctionTimedOut
-# react_loop.py (带调试输出的改进版)
+# react_loop.py (第五天最终版：支持多 session 隔离和清除记忆)
 import os
 import datetime
 import re
 from dotenv import load_dotenv
 from langchain_openai import ChatOpenAI
 from react_parser import parse_react_output
+from memory import ShortTermMemory
 
 load_dotenv()
 api_key = os.getenv("DEEPSEEK_API_KEY")
@@ -13,7 +13,7 @@ api_key = os.getenv("DEEPSEEK_API_KEY")
 llm = ChatOpenAI(
     base_url="https://api.deepseek.com/v1",
     api_key=api_key,
-    model="deepseek-chat",
+    model="deepseek-v4-flash",
     temperature=0
 )
 
@@ -27,11 +27,6 @@ def calculate(expression: str):
     except Exception as e:
         return f"计算错误: {str(e)}"
 
-def slow_tool():
-    """一个测试超时的慢速工具"""
-    time.sleep(6)
-    return "慢速工具执行完成"
-
 tools = {
     "get_current_time": get_current_time,
     "calculate": calculate,
@@ -42,27 +37,34 @@ tool_descriptions = """
 - get_current_time: 获取当前时间，无需参数。
 """
 
-system_prompt = f"""你是一个能够调用工具来回答问题的智能体。你有以下工具可用：
+system_prompt = """你是一个智能助手，可以调用工具回答问题。
 
-{tool_descriptions}
+可用工具：
+- calculate: 执行数学计算，参数为表达式字符串。
+- get_current_time: 获取当前时间，无需参数。
 
-请严格按照以下格式输出，**不要直接给出最终答案，除非你已经通过工具获得了所有信息**。每一步必须包含 Thought 和 Action（或 Final Answer）。例如：
+规则：
+1. 如果用户只是打招呼、自我介绍或问不需要工具的问题，请直接回复 Final Answer。
+2. 如果需要计算或获取时间，按以下格式：
+   Thought: 思考过程
+   Action: 工具名
+   Action Input: 参数（无参数则留空）
+3. 得到观察结果后，如果还需要继续，重复步骤2；否则输出：
+   Final Answer: 最终答案
+4. 只输出上面的内容，不要输出多余的解释。
 
-Thought: 我需要获取当前时间。
-Action: get_current_time
-Action Input: 
+现在开始。"""
 
-然后你会得到观察结果。如果需要继续，再重复上述格式。当你已经获得了足够的信息，可以输出：
-Final Answer: 你的最终答案
+# 全局记忆对象（支持多 session）
+memory = ShortTermMemory(max_history=5)
 
-现在开始！
-
-**特别重要**：如果用户的问题中包含多个任务（例如“先...再...”或“然后...”），你必须依次调用所需的工具，**完成全部任务之后**才能输出 Final Answer。千万不要在只完成部分任务后就提前结束。
-"""
-
-def build_messages(user_input, history):
+def build_messages(user_input, history, session_id):
     messages = [("system", system_prompt)]
-    messages.extend(history)
+    recent = memory.get_recent(session_id)
+    if recent:
+        messages.append(("system", f"之前的对话：\n{recent}"))
+    limited_history = history[-5:] if history else []
+    messages.extend(limited_history)
     messages.append(("user", user_input))
     return messages
 
@@ -76,69 +78,53 @@ def call_llm(messages):
             lc_messages.append(HumanMessage(content=content))
         elif role == "assistant":
             lc_messages.append(AIMessage(content=content))
-    response = llm.invoke(lc_messages)
-    return response.content
+    return llm.invoke(lc_messages).content
 
-from func_timeout import func_timeout, FunctionTimedOut
-
-def execute_tool(action, action_input, timeout=5):
+def execute_tool(action, action_input):
     if action not in tools:
-        return f"错误：未找到工具 '{action}'，可用工具：{', '.join(tools.keys())}"
-    tool_func = tools[action]
+        return f"错误：未找到工具 '{action}'"
     try:
-        # 使用 func_timeout 限制执行时间
         if action_input:
-            result = func_timeout(timeout, tool_func, args=(action_input,))
+            return tools[action](action_input)
         else:
-            result = func_timeout(timeout, tool_func)
-        return result
-    except FunctionTimedOut:
-        return f"工具 '{action}' 执行超时（超过 {timeout} 秒）"
+            return tools[action]()
     except Exception as e:
         return f"工具执行错误: {str(e)}"
-def react_loop(user_input, max_steps=5):
+
+def react_loop(user_input, session_id="default", max_steps=3):
     history = []
     current_step = 0
     tool_called = False
 
     while current_step < max_steps:
-        messages = build_messages(user_input if current_step == 0 else "", history)
+        messages = build_messages(user_input if current_step == 0 else "", history, session_id)
         response = call_llm(messages)
-
-        # ========== 调试输出 ==========
-        print(f"\n--- Step {current_step+1} 模型原始输出 ---")
-        print(response)
-        print("--------------------------------\n")
-        # ================================
+        print(f"\n--- Step {current_step+1} ---\n{response}\n")
 
         parsed = parse_react_output(response)
-        print("解析结果:", parsed)
 
         if "final_answer" in parsed:
-            if tool_called or current_step == max_steps - 1:
-                return parsed["final_answer"]
-            else:
-                history.append(("assistant", response))
-                history.append(("user", "你还没有调用任何工具。请先调用工具获取信息，再给出最终答案。"))
-                current_step += 1
-                continue
+            memory.add(session_id, user_input, parsed["final_answer"])
+            return parsed["final_answer"]
 
         action = parsed.get("action", "")
         action_input = parsed.get("action_input", "")
-        # ===== 手动修复：如果解析出的 action_input 为空，直接从原始响应中提取 =====
+
         if not action_input and "Action Input:" in response:
-            import re
             match = re.search(r"Action Input:\s*(.+?)(?:\n|$)", response)
             if match:
                 raw = match.group(1).strip()
-                # 去掉首尾的引号（如果有）
                 if raw.startswith('"') and raw.endswith('"'):
                     raw = raw[1:-1]
                 if raw.startswith("'") and raw.endswith("'"):
                     raw = raw[1:-1]
                 action_input = raw
-                print(f"手动提取的 action_input: {action_input}")   # 调试输出
-        # ====================================================================
+
+        if not action and tool_called:
+            history.append(("assistant", response))
+            history.append(("user", "请根据上一步的观察结果直接输出 Final Answer。"))
+            current_step += 1
+            continue
 
         if not action:
             history.append(("assistant", response))
@@ -147,18 +133,28 @@ def react_loop(user_input, max_steps=5):
             continue
 
         observation = execute_tool(action, action_input)
+        print(f"工具结果: {observation}")
         tool_called = True
         history.append(("assistant", response))
         history.append(("user", f"Observation: {observation}"))
         current_step += 1
 
-    return "超出最大迭代次数，未能得到最终答案。"
+    return "超出最大步数，未得到最终答案。"
 
 if __name__ == "__main__":
-    print("手动 ReAct Agent 启动。输入 exit 退出。")
+    print("Agent 启动。输入 exit 退出。")
+    # 让用户输入自己的会话ID（可以任意字符串，不同ID的记忆完全隔离）
+    session_id = input("请输入你的用户ID（例如 zhihao, 或直接回车使用 default）：").strip()
+    if not session_id:
+        session_id = "default"
+    print(f"当前用户ID：{session_id}，你的记忆将独立保存。输入 /clear 可清除你的对话记忆。")
     while True:
         user_input = input("\n你问：")
         if user_input.lower() in ["exit", "quit"]:
             break
-        answer = react_loop(user_input)
+        if user_input.lower() == "/clear":
+            memory.clear(session_id)
+            print("你的对话记忆已清除。")
+            continue
+        answer = react_loop(user_input, session_id=session_id)
         print("AI答：", answer)
